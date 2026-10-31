@@ -1,0 +1,953 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>水果合成大作战 · 弹弹版</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: radial-gradient(circle at 50% 0%, #2a2450 0%, #14122b 55%, #0a0918 100%);
+    font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    user-select: none;
+  }
+
+  .stage {
+    position: relative;
+    width: min(380px, 94vw, 52vh);
+    aspect-ratio: 360 / 600;
+    border-radius: 24px;
+    box-shadow:
+      0 0 0 1px rgba(255,255,255,0.08),
+      0 24px 70px rgba(0,0,0,0.6),
+      0 0 90px rgba(120,80,220,0.18);
+    overflow: hidden;
+  }
+
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    touch-action: none;
+    cursor: pointer;
+  }
+
+  .overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(10, 8, 26, 0.86);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.32s ease;
+    z-index: 10;
+  }
+  .overlay.show { opacity: 1; pointer-events: auto; }
+
+  .panel {
+    text-align: center;
+    padding: 30px 36px;
+    border-radius: 22px;
+    background: linear-gradient(160deg, rgba(255,255,255,0.10), rgba(255,255,255,0.03));
+    border: 1px solid rgba(255,255,255,0.14);
+    box-shadow: 0 18px 50px rgba(0,0,0,0.45);
+    transform: translateY(14px) scale(0.94);
+    transition: transform 0.36s cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+  .overlay.show .panel { transform: translateY(0) scale(1); }
+
+  .panel h2 {
+    margin: 0 0 18px;
+    font-size: 26px;
+    letter-spacing: 3px;
+    color: #ffd9a0;
+    text-shadow: 0 0 24px rgba(255, 180, 80, 0.45);
+  }
+
+  .row {
+    display: flex;
+    justify-content: space-between;
+    gap: 28px;
+    margin-bottom: 10px;
+    color: rgba(255,255,255,0.62);
+    font-size: 13px;
+  }
+  .row b { color: #fff; font-size: 19px; font-variant-numeric: tabular-nums; }
+  .row.big b { color: #7ee0a8; font-size: 30px; }
+
+  button {
+    margin-top: 22px;
+    padding: 13px 40px;
+    border: none;
+    border-radius: 999px;
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    color: #22160a;
+    background: linear-gradient(135deg, #ffd479, #ffab4a);
+    box-shadow: 0 10px 26px rgba(255, 160, 60, 0.42);
+    cursor: pointer;
+    transition: transform 0.12s ease, box-shadow 0.2s ease;
+    font-family: inherit;
+  }
+  button:hover { transform: translateY(-2px); box-shadow: 0 14px 32px rgba(255, 160, 60, 0.56); }
+  button:active { transform: translateY(1px) scale(0.97); }
+</style>
+</head>
+<body>
+
+<div class="stage">
+  <canvas id="cv"></canvas>
+
+  <div class="overlay" id="overlay">
+    <div class="panel">
+      <h2>游 戏 结 束</h2>
+      <div class="row big"><span>本局得分</span><b id="finalScore">0</b></div>
+      <div class="row"><span>最高纪录</span><b id="bestScore">0</b></div>
+      <button id="restart">再 来 一 局</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ============================================================
+     一、基础配置（慢速下落 + 明显反弹）
+     ============================================================ */
+  const W = 360;
+  const H = 600;
+
+  const GRAVITY           = 0.30;  // 重力：偏慢，但仍能产生足够撞击速度
+  const RESTITUTION_BALL  = 0.38;  // 水果之间的弹性
+  const RESTITUTION_FLOOR = 0.52;  // 地面弹性（弹得最明显）
+  const RESTITUTION_WALL  = 0.42;  // 墙壁弹性
+  const MIN_BOUNCE_VY     = 1.0;   // 小于这个竖直速度就不再弹，防止抖动
+  const MIN_BOUNCE_VX     = 0.9;   // 小于这个水平速度就不再弹
+  const AIR_DRAG          = 0.994; // 空气阻力
+  const FLOOR_DRAG        = 0.94;  // 地面摩擦
+  const WALL_DRAG         = 0.94;  // 墙壁摩擦
+  const MAX_SPEED         = 14;    // 最大速度，防穿透
+  const ITERATIONS        = 8;
+  const SLOP              = 0.4;
+  const CORRECTION        = 0.85;
+
+  const DEATH_LINE    = 132;
+  const DROP_Y        = 62;
+  const DROP_COOLDOWN = 20;
+  const DANGER_FRAMES = 100;
+
+  /* ============================================================
+     二、水果定义
+     ============================================================ */
+  const FRUITS = [
+    { name: "葡萄",   emoji: "🍇", r: 14, color: "#9b59b6", score: 1  },
+    { name: "樱桃",   emoji: "🍒", r: 19, color: "#e74c3c", score: 3  },
+    { name: "橘子",   emoji: "🍊", r: 25, color: "#f39c12", score: 6  },
+    { name: "柠檬",   emoji: "🍋", r: 32, color: "#f1c40f", score: 10 },
+    { name: "猕猴桃", emoji: "🥝", r: 39, color: "#7cb342", score: 15 },
+    { name: "番茄",   emoji: "🍅", r: 47, color: "#e53935", score: 21 },
+    { name: "桃子",   emoji: "🍑", r: 55, color: "#ff8a80", score: 28 },
+    { name: "菠萝",   emoji: "🍍", r: 64, color: "#fdd835", score: 36 },
+    { name: "椰子",   emoji: "🥥", r: 74, color: "#a1887f", score: 45 },
+    { name: "西瓜",   emoji: "🍉", r: 86, color: "#43a047", score: 60 }
+  ];
+
+  FRUITS.forEach(f => {
+    const n = parseInt(f.color.slice(1), 16);
+    f.rgb = `${(n >> 16) & 255},${(n >> 8) & 255},${n & 255}`;
+  });
+
+  const SPAWN_WEIGHTS = [50, 30, 13, 5, 2];
+  const SPAWN_TOTAL = SPAWN_WEIGHTS.reduce((a, b) => a + b, 0);
+
+  function randomLevel() {
+    let r = Math.random() * SPAWN_TOTAL;
+    for (let i = 0; i < SPAWN_WEIGHTS.length; i++) {
+      r -= SPAWN_WEIGHTS[i];
+      if (r <= 0) return i;
+    }
+    return 0;
+  }
+
+  /* ============================================================
+     三、画布初始化
+     ============================================================ */
+  const cv = document.getElementById("cv");
+  const ctx = cv.getContext("2d");
+  const DPR = Math.min(window.devicePixelRatio || 1, 2);
+
+  cv.width = W * DPR;
+  cv.height = H * DPR;
+  ctx.scale(DPR, DPR);
+
+  /* ============================================================
+     四、游戏状态
+     ============================================================ */
+  let balls = [];
+  let particles = [];
+  let score = 0;
+  let bestScore = 0;
+  let gameOver = false;
+
+  let currentX = W / 2;
+  let nextLevel = randomLevel();
+  let canDrop = true;
+  let dropCooldown = 0;
+  let dangerTimer = 0;
+
+  try {
+    bestScore = parseInt(localStorage.getItem("fruitMergeBest") || "0", 10) || 0;
+  } catch (e) { bestScore = 0; }
+
+  /* ============================================================
+     五、音效
+     ============================================================ */
+  let audioCtx = null;
+
+  function initAudio() {
+    if (audioCtx) return;
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+    catch (e) { audioCtx = null; }
+  }
+
+  function beep(freq, dur, type, vol) {
+    if (!audioCtx) return;
+    dur = dur || 0.09;
+    type = type || "triangle";
+    vol = vol || 0.05;
+    try {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = type;
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start();
+      osc.stop(audioCtx.currentTime + dur);
+    } catch (e) {}
+  }
+
+  /* ============================================================
+     六、水果对象（增加挤压变形字段）
+     ============================================================ */
+  function makeBall(x, y, level, vx, vy) {
+    const f = FRUITS[level];
+    return {
+      x: x, y: y,
+      vx: vx || 0, vy: vy || 0,
+      level: level, r: f.r,
+      mass: f.r * f.r,
+      rot: 0, pop: 0,
+      dead: false,
+      born: performance.now(),
+
+      /* 挤压动画 */
+      sqY: 0,   // 垂直挤压程度（撞地产生）
+      sqX: 0    // 水平挤压程度（撞墙产生）
+    };
+  }
+
+  /* ============================================================
+     七、物理：墙体 —— 带反弹 + 挤压
+     ============================================================ */
+  function resolveWall(b) {
+    // 地面
+    if (b.y + b.r > H) {
+      b.y = H - b.r;
+      if (b.vy > 0) {
+        // 撞击越猛，挤压越明显
+        b.sqY = Math.min(1, b.vy / 9);
+
+        if (b.vy > MIN_BOUNCE_VY) {
+          b.vy = -b.vy * RESTITUTION_FLOOR;
+        } else {
+          b.vy = 0;
+        }
+        b.vx *= FLOOR_DRAG;
+      }
+    }
+
+    // 左墙
+    if (b.x - b.r < 0) {
+      b.x = b.r;
+      if (b.vx < 0) {
+        b.sqX = Math.min(1, Math.abs(b.vx) / 8);
+
+        if (Math.abs(b.vx) > MIN_BOUNCE_VX) {
+          b.vx = -b.vx * RESTITUTION_WALL;
+        } else {
+          b.vx = 0;
+        }
+        b.vy *= WALL_DRAG;
+      }
+    }
+
+    // 右墙
+    if (b.x + b.r > W) {
+      b.x = W - b.r;
+      if (b.vx > 0) {
+        b.sqX = Math.min(1, Math.abs(b.vx) / 8);
+
+        if (Math.abs(b.vx) > MIN_BOUNCE_VX) {
+          b.vx = -b.vx * RESTITUTION_WALL;
+        } else {
+          b.vx = 0;
+        }
+        b.vy *= WALL_DRAG;
+      }
+    }
+  }
+
+  /* ============================================================
+     八、物理：两球碰撞
+     ============================================================ */
+  function resolvePair(a, b) {
+    if (a.dead || b.dead) return;
+
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let distSq = dx * dx + dy * dy;
+    const minDist = a.r + b.r;
+
+    if (distSq >= minDist * minDist) return;
+
+    let dist = Math.sqrt(distSq);
+
+    if (dist < 0.0001) {
+      const ang = Math.random() * Math.PI * 2;
+      dx = Math.cos(ang); dy = Math.sin(ang); dist = 1;
+    }
+
+    const nx = dx / dist, ny = dy / dist;
+
+    const overlap = minDist - dist;
+    const correction = Math.max(overlap - SLOP, 0) * CORRECTION;
+    const totalMass = a.mass + b.mass;
+    const aShare = b.mass / totalMass;
+    const bShare = a.mass / totalMass;
+
+    a.x -= nx * correction * aShare;
+    a.y -= ny * correction * aShare;
+    b.x += nx * correction * bShare;
+    b.y += ny * correction * bShare;
+
+    const rvx = b.vx - a.vx;
+    const rvy = b.vy - a.vy;
+    const velNormal = rvx * nx + rvy * ny;
+
+    if (velNormal > 0) return;
+
+    const invMassSum = 1 / a.mass + 1 / b.mass;
+    const j = -(1 + RESTITUTION_BALL) * velNormal / invMassSum;
+
+    a.vx -= (j * nx) / a.mass;
+    a.vy -= (j * ny) / a.mass;
+    b.vx += (j * nx) / b.mass;
+    b.vy += (j * ny) / b.mass;
+
+    // 切向摩擦，防止堆叠滑动
+    const tx = -ny, ty = nx;
+    const velTangent = rvx * tx + rvy * ty;
+    const jt = (-velTangent / invMassSum) * 0.22;
+
+    a.vx -= (jt * tx) / a.mass;
+    a.vy -= (jt * ty) / a.mass;
+    b.vx += (jt * tx) / b.mass;
+    b.vy += (jt * ty) / b.mass;
+
+    // 轻微挤压反馈
+    if (Math.abs(velNormal) > 2.2) {
+      const sq = Math.min(1, Math.abs(velNormal) / 14);
+      a.sqY = Math.max(a.sqY, sq * 0.4);
+      b.sqY = Math.max(b.sqY, sq * 0.4);
+    }
+  }
+
+  /* ============================================================
+     九、合成
+     ============================================================ */
+  function checkMerges() {
+    const pairs = [];
+
+    for (let i = 0; i < balls.length; i++) {
+      const a = balls[i];
+      if (a.dead) continue;
+      for (let j = i + 1; j < balls.length; j++) {
+        const b = balls[j];
+        if (b.dead) continue;
+        if (a.level !== b.level) continue;
+        if (a.level >= FRUITS.length - 1) continue;
+
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const minDist = a.r + b.r;
+        if (dx * dx + dy * dy < minDist * minDist) pairs.push([a, b]);
+      }
+    }
+
+    for (let k = 0; k < pairs.length; k++) {
+      const a = pairs[k][0];
+      const b = pairs[k][1];
+      if (a.dead || b.dead) continue;
+
+      a.dead = true;
+      b.dead = true;
+
+      const newLevel = a.level + 1;
+      const nx = (a.x + b.x) / 2;
+      const ny = (a.y + b.y) / 2;
+
+      const nb = makeBall(nx, ny, newLevel);
+      nb.vx = (a.vx + b.vx) / 2;
+      nb.vy = (a.vy + b.vy) / 2 - 0.8;  // 轻微上抛
+      nb.pop = 1;
+      nb.born = performance.now();
+      // 新水果出生时的弹性挤压
+      nb.sqY = 0.5;
+
+      balls.push(nb);
+      score += FRUITS[newLevel].score;
+
+      burst(nx, ny, FRUITS[newLevel].color);
+      beep(360 + newLevel * 55, 0.13, "triangle", 0.055);
+
+      if (newLevel === FRUITS.length - 1) {
+        beep(880, 0.18, "sine", 0.07);
+        setTimeout(() => beep(1180, 0.22, "sine", 0.07), 110);
+      }
+    }
+  }
+
+  /* ============================================================
+     十、粒子
+     ============================================================ */
+  function burst(x, y, color) {
+    const n = 14;
+    for (let i = 0; i < n; i++) {
+      const ang = (Math.PI * 2 * i) / n + Math.random() * 0.5;
+      const spd = 1.5 + Math.random() * 4;
+      particles.push({
+        x: x, y: y,
+        vx: Math.cos(ang) * spd,
+        vy: Math.sin(ang) * spd - 1,
+        life: 1, color: color,
+        r: 1.6 + Math.random() * 3
+      });
+    }
+  }
+
+  function updateParticles() {
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.x += p.vx;
+      p.y += p.vy;
+      p.vy += 0.20;
+      p.vx *= 0.97;
+      p.vy *= 0.97;
+      p.life -= 0.028;
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+  }
+
+  /* ============================================================
+     十一、危险检测（考虑弹性，按位置+低速判定）
+     ============================================================ */
+  function checkDanger() {
+    const now = performance.now();
+    let danger = false;
+
+    for (let i = 0; i < balls.length; i++) {
+      const b = balls[i];
+      if (now - b.born < 1200) continue;
+      if (b.y - b.r > DEATH_LINE) continue;
+      if (Math.abs(b.vy) > 1.6) continue;
+      if (Math.abs(b.vx) > 1.6) continue;
+      danger = true;
+      break;
+    }
+
+    if (danger) {
+      dangerTimer++;
+      if (dangerTimer >= DANGER_FRAMES) endGame();
+    } else {
+      dangerTimer = Math.max(0, dangerTimer - 3);
+    }
+  }
+
+  /* ============================================================
+     十二、结束 / 重开
+     ============================================================ */
+  function endGame() {
+    if (gameOver) return;
+    gameOver = true;
+
+    if (score > bestScore) {
+      bestScore = score;
+      try { localStorage.setItem("fruitMergeBest", String(bestScore)); } catch (e) {}
+    }
+
+    document.getElementById("finalScore").textContent = score;
+    document.getElementById("bestScore").textContent = bestScore;
+    document.getElementById("overlay").classList.add("show");
+
+    beep(300, 0.18, "sawtooth", 0.05);
+    setTimeout(() => beep(220, 0.28, "sawtooth", 0.05), 150);
+  }
+
+  function restart() {
+    balls.length = 0;
+    particles.length = 0;
+    score = 0;
+    gameOver = false;
+    dangerTimer = 0;
+    canDrop = true;
+    dropCooldown = 0;
+    currentX = W / 2;
+    nextLevel = randomLevel();
+    document.getElementById("overlay").classList.remove("show");
+  }
+
+  /* ============================================================
+     十三、落下水果
+     ============================================================ */
+  function drop() {
+    if (!canDrop || gameOver) return;
+
+    const ball = makeBall(currentX, DROP_Y, nextLevel);
+    ball.vy = 1.2;
+    ball.sqY = -0.6;   // 起手拉长一下，像被"拉下来"
+    balls.push(ball);
+
+    canDrop = false;
+    dropCooldown = DROP_COOLDOWN;
+    nextLevel = randomLevel();
+
+    const r = FRUITS[nextLevel].r;
+    currentX = Math.max(r + 4, Math.min(W - r - 4, currentX));
+
+    beep(520, 0.05, "sine", 0.03);
+  }
+
+  /* ============================================================
+     十四、单帧更新
+     ============================================================ */
+  function update() {
+    updateParticles();
+
+    if (gameOver) return;
+
+    if (dropCooldown > 0) {
+      dropCooldown--;
+      if (dropCooldown === 0) canDrop = true;
+    }
+
+    for (let i = 0; i < balls.length; i++) {
+      const b = balls[i];
+
+      b.vy += GRAVITY;
+      b.vx *= AIR_DRAG;
+      b.vy *= AIR_DRAG;
+
+      if (b.vx > MAX_SPEED) b.vx = MAX_SPEED;
+      if (b.vx < -MAX_SPEED) b.vx = -MAX_SPEED;
+      if (b.vy > MAX_SPEED) b.vy = MAX_SPEED;
+      if (b.vy < -MAX_SPEED) b.vy = -MAX_SPEED;
+
+      b.x += b.vx;
+      b.y += b.vy;
+
+      b.rot += b.vx * 0.02;
+
+      // 挤压回弹动画衰减
+      if (b.sqY > 0) {
+        b.sqY *= 0.80;
+        if (b.sqY < 0.01) b.sqY = 0;
+      } else if (b.sqY < 0) {
+        // 拉长状态（下落起手）快速回正
+        b.sqY *= 0.84;
+        if (b.sqY > -0.01) b.sqY = 0;
+      }
+
+      if (b.sqX > 0) {
+        b.sqX *= 0.80;
+        if (b.sqX < 0.01) b.sqX = 0;
+      }
+
+      if (b.pop > 0) {
+        b.pop *= 0.86;
+        if (b.pop < 0.01) b.pop = 0;
+      }
+    }
+
+    for (let iter = 0; iter < ITERATIONS; iter++) {
+      for (let i = 0; i < balls.length; i++) resolveWall(balls[i]);
+      for (let i = 0; i < balls.length; i++) {
+        const a = balls[i];
+        if (a.dead) continue;
+        for (let j = i + 1; j < balls.length; j++) {
+          const b = balls[j];
+          if (b.dead) continue;
+          resolvePair(a, b);
+        }
+      }
+    }
+
+    checkMerges();
+
+    if (balls.some(b => b.dead)) balls = balls.filter(b => !b.dead);
+
+    checkDanger();
+  }
+
+  /* ============================================================
+     十五、渲染
+     ============================================================ */
+  function drawBackground() {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, "#211c46");
+    g.addColorStop(0.55, "#161334");
+    g.addColorStop(1, "#0b0a1c");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.fillStyle = "rgba(255,255,255,0.06)";
+    for (let i = 0; i < 26; i++) {
+      const x = (i * 137.5) % W;
+      const y = (i * 211.3) % H;
+      const r = 0.8 + ((i * 7) % 3) * 0.6;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    const lw = ctx.createLinearGradient(0, 0, 10, 0);
+    lw.addColorStop(0, "rgba(150,120,255,0.16)");
+    lw.addColorStop(1, "rgba(150,120,255,0)");
+    ctx.fillStyle = lw;
+    ctx.fillRect(0, 0, 10, H);
+
+    const rw = ctx.createLinearGradient(W, 0, W - 10, 0);
+    rw.addColorStop(0, "rgba(150,120,255,0.16)");
+    rw.addColorStop(1, "rgba(150,120,255,0)");
+    ctx.fillStyle = rw;
+    ctx.fillRect(W - 10, 0, 10, H);
+
+    const fg = ctx.createLinearGradient(0, H - 40, 0, H);
+    fg.addColorStop(0, "rgba(120,90,220,0)");
+    fg.addColorStop(1, "rgba(120,90,220,0.22)");
+    ctx.fillStyle = fg;
+    ctx.fillRect(0, H - 40, W, 40);
+  }
+
+  function drawDeathLine() {
+    const dangerRatio = Math.min(dangerTimer / DANGER_FRAMES, 1);
+    const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 130);
+
+    let alpha = 0.16;
+    let color = "255,120,120";
+    if (dangerRatio > 0) {
+      alpha = 0.2 + dangerRatio * 0.55 * pulse;
+      color = "255,70,70";
+    }
+
+    ctx.save();
+    ctx.setLineDash([9, 8]);
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = `rgba(${color},${alpha})`;
+    ctx.beginPath();
+    ctx.moveTo(0, DEATH_LINE);
+    ctx.lineTo(W, DEATH_LINE);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawBall(b, alpha) {
+    const f = FRUITS[b.level];
+    const popScale = 1 + b.pop * 0.35;
+    const r = b.r * popScale;
+
+    /* 挤压变形：sqY 越大 → 垂直压扁、水平拉长；
+       sqX 越大 → 水平压扁、垂直拉长 */
+    const maxSquash = 0.30;
+    let scaleX = 1 - b.sqX * maxSquash + b.sqY * maxSquash;
+    let scaleY = 1 + b.sqX * maxSquash - b.sqY * maxSquash;
+    // 防止变形过头
+    scaleX = Math.max(0.62, Math.min(1.42, scaleX));
+    scaleY = Math.max(0.62, Math.min(1.42, scaleY));
+
+    ctx.save();
+    if (alpha !== undefined) ctx.globalAlpha = alpha;
+
+    ctx.translate(b.x, b.y);
+    ctx.rotate(b.rot);
+
+    /* 挤压时给一个轻微的形变动感：
+       仅在非旋转小球（或旋转角很小）时应用，避免视觉歪掉 */
+    ctx.scale(scaleX, scaleY);
+
+    // 光晕
+    const grad = ctx.createRadialGradient(-r * 0.32, -r * 0.34, r * 0.08, 0, 0, r);
+    grad.addColorStop(0, `rgba(${f.rgb},0.52)`);
+    grad.addColorStop(0.7, `rgba(${f.rgb},0.24)`);
+    grad.addColorStop(1, `rgba(${f.rgb},0.10)`);
+
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    ctx.lineWidth = Math.max(1.4, r * 0.055);
+    ctx.strokeStyle = `rgba(${f.rgb},0.82)`;
+    ctx.stroke();
+
+    // 高光
+    ctx.beginPath();
+    ctx.arc(0, 0, r * 0.86, Math.PI * 1.08, Math.PI * 1.58);
+    ctx.lineWidth = Math.max(1.4, r * 0.10);
+    ctx.strokeStyle = "rgba(255,255,255,0.30)";
+    ctx.lineCap = "round";
+    ctx.stroke();
+
+    // emoji
+    ctx.font = `${r * 1.72}px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji","EmojiOne Color",sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(f.emoji, 0, r * 0.05);
+
+    ctx.restore();
+  }
+
+  function drawParticles() {
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      ctx.globalAlpha = Math.max(p.life, 0);
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r * p.life, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawAim() {
+    if (gameOver || !canDrop) return;
+    const f = FRUITS[nextLevel];
+
+    ctx.save();
+    ctx.setLineDash([5, 10]);
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "rgba(255,255,255,0.14)";
+    ctx.beginPath();
+    ctx.moveTo(currentX, DROP_Y + f.r);
+    ctx.lineTo(currentX, H - 6);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawPreview() {
+    if (gameOver) return;
+
+    const f = FRUITS[nextLevel];
+    const alpha = canDrop ? 1 : Math.max(0, 1 - dropCooldown / DROP_COOLDOWN);
+
+    if (canDrop) {
+      ctx.save();
+      ctx.globalAlpha = 0.5 + 0.25 * Math.sin(performance.now() / 260);
+      ctx.fillStyle = "rgba(255,255,255,0.55)";
+      ctx.beginPath();
+      ctx.moveTo(currentX, DROP_Y + f.r + 6);
+      ctx.lineTo(currentX - 6, DROP_Y + f.r + 16);
+      ctx.lineTo(currentX + 6, DROP_Y + f.r + 16);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+
+    drawBall({
+      x: currentX, y: DROP_Y,
+      r: f.r, level: nextLevel,
+      pop: 0, rot: 0,
+      sqX: 0, sqY: 0
+    }, alpha);
+  }
+
+  function drawUI() {
+    ctx.save();
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+
+    ctx.font = "10px system-ui, sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.42)";
+    ctx.fillText("SCORE", 20, 14);
+
+    ctx.font = "bold 28px system-ui, sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.95)";
+    ctx.shadowColor = "rgba(120,200,255,0.5)";
+    ctx.shadowBlur = 14;
+    ctx.fillText(String(score), 20, 27);
+
+    ctx.shadowBlur = 0;
+    ctx.font = "11px system-ui, sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.34)";
+    ctx.fillText("最高 " + Math.max(bestScore, score), 20, 62);
+    ctx.restore();
+
+    ctx.save();
+    ctx.textAlign = "right";
+    ctx.textBaseline = "top";
+    ctx.font = "10px system-ui, sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.42)";
+    ctx.fillText("NEXT", W - 20, 14);
+    ctx.restore();
+
+    const nf = FRUITS[nextLevel];
+    const cx = W - 40, cy = 56, cr = 17;
+
+    ctx.save();
+    const ng = ctx.createRadialGradient(cx - 6, cy - 7, 2, cx, cy, cr);
+    ng.addColorStop(0, `rgba(${nf.rgb},0.55)`);
+    ng.addColorStop(1, `rgba(${nf.rgb},0.18)`);
+    ctx.beginPath();
+    ctx.arc(cx, cy, cr, 0, Math.PI * 2);
+    ctx.fillStyle = ng;
+    ctx.fill();
+    ctx.lineWidth = 1.6;
+    ctx.strokeStyle = `rgba(${nf.rgb},0.8)`;
+    ctx.stroke();
+
+    ctx.font = `${cr * 1.6}px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(nf.emoji, cx, cy + 1);
+    ctx.restore();
+  }
+
+  function render() {
+    ctx.clearRect(0, 0, W, H);
+    drawBackground();
+    drawDeathLine();
+    drawAim();
+    for (let i = 0; i < balls.length; i++) drawBall(balls[i]);
+    drawParticles();
+    drawPreview();
+    drawUI();
+  }
+
+  /* ============================================================
+     十六、主循环
+     ============================================================ */
+  const DT = 1000 / 60;
+  let lastT = 0;
+  let acc = 0;
+
+  function frame(t) {
+    requestAnimationFrame(frame);
+
+    if (!lastT) lastT = t;
+    let delta = t - lastT;
+    lastT = t;
+    if (delta > 200) delta = 200;
+
+    acc += delta;
+
+    let steps = 0;
+    while (acc >= DT && steps < 5) {
+      update();
+      acc -= DT;
+      steps++;
+    }
+    if (steps >= 5) acc = 0;
+
+    render();
+  }
+
+  /* ============================================================
+     十七、交互
+     ============================================================ */
+  let dragging = false;
+
+  function updateAim(e) {
+    const rect = cv.getBoundingClientRect();
+    const scaleX = W / rect.width;
+    let x = (e.clientX - rect.left) * scaleX;
+    const r = FRUITS[nextLevel].r;
+    const pad = r + 4;
+    currentX = Math.max(pad, Math.min(W - pad, x));
+  }
+
+  cv.addEventListener("pointerdown", function (e) {
+    initAudio();
+    if (gameOver) return;
+    dragging = true;
+    updateAim(e);
+    try { cv.setPointerCapture(e.pointerId); } catch (err) {}
+    e.preventDefault();
+  });
+
+  cv.addEventListener("pointermove", function (e) {
+    if (gameOver) return;
+    updateAim(e);
+  });
+
+  cv.addEventListener("pointerup", function (e) {
+    if (!dragging) return;
+    dragging = false;
+    updateAim(e);
+    drop();
+    e.preventDefault();
+  });
+
+  cv.addEventListener("pointercancel", function () { dragging = false; });
+
+  window.addEventListener("keydown", function (e) {
+    if (gameOver) return;
+    const r = FRUITS[nextLevel].r;
+
+    if (e.key === "ArrowLeft") {
+      currentX = Math.max(r + 4, currentX - 14);
+      e.preventDefault();
+    } else if (e.key === "ArrowRight") {
+      currentX = Math.min(W - r - 4, currentX + 14);
+      e.preventDefault();
+    } else if (e.key === " " || e.key === "Enter") {
+      initAudio();
+      drop();
+      e.preventDefault();
+    }
+  });
+
+  document.getElementById("restart").addEventListener("click", function (e) {
+    initAudio();
+    restart();
+    e.stopPropagation();
+  });
+
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) lastT = 0;
+  });
+
+  /* ============================================================
+     十八、启动
+     ============================================================ */
+  document.getElementById("bestScore").textContent = bestScore;
+  requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
